@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from tqdm import tqdm
 import os
 
-from config import *
+from src.config import *
 
 binance_exchange = ccxt.binanceus({
     'timeout': 15000,
@@ -24,26 +24,32 @@ def download_data(start_date, end_date, interval='1d', filepath='../data/raw/', 
         filename = f'master_crypto_data_{start_date}_{end_date}_{interval}.parquet'
     FILEPATH = filepath + filename
     
-    active_usdt_tickers = get_tickers()
-    all_data = []
-    
-    for ticker in tqdm(active_usdt_tickers, desc="Fetching crypto data"):
-        try:
-            cleaned_ticker = ticker.replace('/', '')
-            df = fetch_data(cleaned_ticker, start_date, end_date, interval)
-            all_data.append(df)
-            print(f"Data for {cleaned_ticker} fetched successfully.")
-        except Exception as e:
-            print(f"Error fetching data for {ticker}: {e}")
-        break
-    
-    # Concatenate all the DataFrames into one master DataFrame
-    master_data = pd.concat(all_data, ignore_index=True)
-    
-    # Save the master DataFrame to a Parquet file
-    if save:
-        master_data.to_parquet(FILEPATH, index=False)
-        print(f"Master parquet file saved: {FILEPATH}")
+    try:
+        master_data = pd.read_parquet(FILEPATH)
+        print(f'{filename} loaded successfully.')
+    except:
+        active_usdt_tickers = get_tickers()
+        all_data = []
+        
+        for ticker in tqdm(active_usdt_tickers, desc="Fetching crypto data"):
+            try:
+                cleaned_ticker = ticker.replace('/', '')
+                df = fetch_data(cleaned_ticker, start_date, end_date, interval)
+                all_data.append(df)
+                print(f"Data for {cleaned_ticker} fetched successfully.")
+            except Exception as e:
+                print(f"Error fetching data for {ticker}: {e}")
+
+        # Concatenate all the DataFrames into one master DataFrame
+        master_data = pd.concat(all_data, ignore_index=True)
+        
+        # Save the master DataFrame to a Parquet file
+        if save:
+            try:
+                master_data.to_parquet(FILEPATH, index=False)
+                print(f"Master parquet file saved: {FILEPATH}")
+            except Exception as e:
+                print(f"Error saving master parquet file: {e}")
     
     return master_data
 
@@ -66,8 +72,7 @@ def fetch_data(ticker_symbol, start_date, end_date, interval):
 
     # Obtain raw data from Binance US
     full_data_list = obtain_full_spotdata(start_timestamp, end_timestamp, binance_exchange, ticker_symbol, interval=interval)
-    print(full_data_list)
-    
+
     # Create a DataFrame with the correct column names
     data = pd.DataFrame(full_data_list, columns=SPOT_COLUMNS)
     data['Open time'] = data['Open time'].apply(lambda x: transform_timestamp(int(x)))
@@ -134,31 +139,25 @@ def transform_to_timestamp_integer(datetime_object):
 
     return int(datetime_object.timestamp() * 1000)
 
-def obtain_full_spotdata(start_timestamp,
-                         end_timestamp,
-                         exchange, symbol, interval = '1h',
-                         limit = 1000):
-
-    time_difference = int(convert_to_seconds(interval) * limit * 1000)
-
+def obtain_full_spotdata(start_timestamp, end_timestamp, exchange, symbol, interval='1d', limit=1000):
     full_data_list = []
+    curr_timestamp = start_timestamp
 
-    curr_time = start_timestamp + time_difference
-    while (curr_time + time_difference < end_timestamp):
-        data_list = get_spot(exchange = exchange, symbol = symbol, interval = interval,
-                             endTime = curr_time,
-                             limit = limit)
-        full_data_list = full_data_list + data_list
+    while curr_timestamp < end_timestamp:
+        data_list = get_spot(exchange=exchange, symbol=symbol, interval=interval, startTime=curr_timestamp, limit=limit)
+        if not data_list:
+            break
 
+        full_data_list.extend(data_list)
+
+        # Use the last candle's open time plus one interval as the new start timestamp
+        last_candle = data_list[-1]
+        last_timestamp = int(last_candle[0])
+        # Increment by one day (in milliseconds) to avoid overlap
+        curr_timestamp = last_timestamp + convert_to_seconds(interval) * 1000
+
+        # Sleep to respect rate limits
         time.sleep(0.2)
-        curr_time += time_difference
-
-    data_list = get_spot(exchange = exchange, symbol = symbol, interval = interval,
-                        startTime = curr_time,
-                        endTime = end_timestamp,
-                        limit = limit)
-
-    full_data_list = full_data_list + data_list
 
     return full_data_list
 
