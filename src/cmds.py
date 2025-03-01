@@ -1,5 +1,9 @@
 import polars as pl
 import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 def compute_percentile_rank_series(series, interval: int = None, window: int = None, min_periods=None):
     """
@@ -267,11 +271,143 @@ def marketcap_weighted_portfolio(return_df: pl.DataFrame, mcap_df: pl.DataFrame)
     # For each coin, multiply its return (from the return_df) by its weight and sum.
     portfolio_expr = sum(pl.col(f"w_{coin}") * pl.col(coin) for coin in common_coins)
     portfolio_df = daily.with_columns(
-        portfolio_expr.alias("MC_weighted_return")
-    ).select(["date", "MC_weighted_return"])
+        portfolio_expr.alias("MCW_return")
+    ).select(["date", "MCW_return"])
     
     # Create a weights DataFrame with date and each coin's weight.
     weight_cols = [f"w_{coin}" for coin in common_coins]
     weights_df = daily.select(["date"] + weight_cols)
     
     return portfolio_df, weights_df
+
+
+def compute_regression_matrices(rets: pl.DataFrame, j_list: list, k_list: list):
+    """
+    Given a Polars DataFrame 'rets' with a "date" column and a single ticker column,
+    and lists of lookback parameters j_list and holding period parameters k_list,
+    this function:
+    
+      1. Checks that 'rets' has only one ticker column (besides "date").
+      2. For each combination of j (row: previous-return lookback) and k (column: look-ahead holding period):
+            - Computes the previous return percentile series: p_{t-j,t}
+              using add_prev_return_percentile_ranks(rets, j)
+            - Computes the look-ahead return percentile series: p_{t,t+k}
+              using add_lookahead_return_percentile_ranks(rets, k)
+            - Merges the two series on "date", drops rows with NA values in either series,
+              and then runs a linear regression:
+                look_ahead_p = alpha + beta * prev_p + epsilon
+            - Saves the beta coefficient and its p-value.
+      3. Returns two pandas DataFrames:
+            - beta_df: rows indexed by j values, columns labeled by k values.
+            - pval_df: same structure containing the corresponding p-values.
+            
+    Parameters:
+      rets: Polars DataFrame with columns ["date", ticker]
+      j_list: list of integer j parameters (for previous return lookback). These will index the rows.
+      k_list: list of integer k parameters (for look-ahead holding period). These will label the columns.
+      
+    Returns:
+      beta_df, pval_df
+    """
+    # Check that there is only one ticker column (excluding "date")
+    ticker_cols = [col for col in rets.columns if col != "date"]
+    if len(ticker_cols) != 1:
+        raise ValueError("Input DataFrame must have exactly one ticker column (excluding 'date').")
+    ticker = ticker_cols[0]
+    
+    # Initialize dictionaries to collect regression results.
+    # Outer keys will be j (rows) and inner keys will be k (columns).
+    beta_results = {}
+    pval_results = {}
+    
+    # Outer loop: iterate over each j (previous-return lookback) with a progress bar.
+    for j in tqdm(j_list, desc="Processing j parameters (rows)"):
+        beta_results[j] = {}
+        pval_results[j] = {}
+        
+        # Compute the previous return percentile series for parameter j.
+        prev_df = add_prev_return_percentile_ranks(rets, j)
+        # Rename the ticker column to "prev" for clarity.
+        prev_df = prev_df.rename({ticker: "prev"})
+        
+        # Inner loop: iterate over each k (look-ahead holding period) with a nested progress bar.
+        for k in tqdm(k_list, desc=f"j={j}: Processing k parameters (columns)", leave=False):
+            # Compute the look-ahead return percentile series for parameter k.
+            look_df = add_lookahead_return_percentile_ranks(rets, k)
+            # Rename the ticker column to "look" for clarity.
+            look_df = look_df.rename({ticker: "look"})
+            
+            # Merge the two DataFrames on "date" and drop rows with NA in either series.
+            merged = prev_df.join(look_df, on="date", how="inner")
+            merged = merged.drop_nulls(subset=["prev", "look"])
+            
+            # If too few observations remain, store NaN.
+            if merged.height < 10:
+                beta_results[j][k] = np.nan
+                pval_results[j][k] = np.nan
+                continue
+                
+            # Convert the merged Polars DataFrame to a pandas DataFrame for statsmodels.
+            mdf = merged.to_pandas()
+            
+            # Set up the regression: y (look) = alpha + beta * prev + error.
+            X = sm.add_constant(mdf["prev"])
+            y = mdf["look"]
+            model = sm.OLS(y, X).fit()
+            beta_results[j][k] = model.params["prev"]
+            pval_results[j][k] = model.pvalues["prev"]
+    
+    # Convert nested dictionaries to pandas DataFrames.
+    # Rows correspond to j (previous lookback), and columns correspond to k (look-ahead holding period).
+    beta_df = pd.DataFrame(beta_results).T.sort_index()
+    pval_df = pd.DataFrame(pval_results).T.sort_index()
+    
+    # Rename index and columns explicitly
+    beta_df.index.name = "j"
+    beta_df.columns.name = "k"
+    
+    pval_df.index.name = "j"
+    pval_df.columns.name = "k"
+    
+    return beta_df, pval_df
+
+def plot_heatmaps_j_k(beta_df: pd.DataFrame, pval_df: pd.DataFrame):
+    """
+    Given two DataFrames:
+       - beta_df: rows indexed by j values and columns labeled by k values.
+       - pval_df: same structure containing p-values.
+    This function creates two separate heatmaps (using matplotlib):
+       one for beta coefficients and one for p-values.
+    """
+    # Plot Beta heatmap.
+    plt.figure(figsize=(8, 6))
+    plt.imshow(beta_df.values, aspect='auto', cmap='viridis')
+    plt.colorbar(label='Beta')
+    plt.xticks(ticks=np.arange(len(beta_df.columns)), labels=beta_df.columns)
+    plt.yticks(ticks=np.arange(len(beta_df.index)), labels=beta_df.index)
+    plt.title("Beta Heatmap (rows: j, cols: k)")
+    plt.xlabel("k (look-ahead holding period)")
+    plt.ylabel("j (previous lookback)")
+    plt.show()
+    
+    # Plot P-Value heatmap.
+    plt.figure(figsize=(8, 6))
+    plt.imshow(pval_df.values, aspect='auto', cmap='viridis')
+    plt.colorbar(label='P-Value')
+    plt.xticks(ticks=np.arange(len(pval_df.columns)), labels=pval_df.columns)
+    plt.yticks(ticks=np.arange(len(pval_df.index)), labels=pval_df.index)
+    plt.title("P-Value Heatmap (rows: j, cols: k)")
+    plt.xlabel("k (look-ahead holding period)")
+    plt.ylabel("j (previous lookback)")
+    plt.show()
+
+def rank_param(df):
+  # Melt the DataFrame to long format
+  long_df = df.reset_index().melt(id_vars='j', var_name='k', value_name='value')
+  # Rename the columns for clarity
+  long_df.columns = ['j', 'k', 'value']
+  # Rank the values from min to max
+  long_df['rank'] = long_df['value'].rank()
+  # Sort the DataFrame by rank
+  long_df = long_df.sort_values(by='rank')
+  return long_df
