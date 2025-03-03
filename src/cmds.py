@@ -296,10 +296,11 @@ def compute_regression_matrices(rets: pl.DataFrame, j_list: list, k_list: list):
             - Merges the two series on "date", drops rows with NA values in either series,
               and then runs a linear regression:
                 look_ahead_p = alpha + beta * prev_p + epsilon
-            - Saves the beta coefficient and its p-value.
-      3. Returns two pandas DataFrames:
+            - Saves the beta coefficient, its p-value, and the R² of the regression.
+      3. Returns three pandas DataFrames:
             - beta_df: rows indexed by j values, columns labeled by k values.
             - pval_df: same structure containing the corresponding p-values.
+            - r2_df: same structure containing the R² values.
             
     Parameters:
       rets: Polars DataFrame with columns ["date", ticker]
@@ -307,7 +308,7 @@ def compute_regression_matrices(rets: pl.DataFrame, j_list: list, k_list: list):
       k_list: list of integer k parameters (for look-ahead holding period). These will label the columns.
       
     Returns:
-      beta_df, pval_df
+      beta_df, pval_df, r2_df
     """
     # Check that there is only one ticker column (excluding "date")
     ticker_cols = [col for col in rets.columns if col != "date"]
@@ -316,14 +317,16 @@ def compute_regression_matrices(rets: pl.DataFrame, j_list: list, k_list: list):
     ticker = ticker_cols[0]
     
     # Initialize dictionaries to collect regression results.
-    # Outer keys will be j (rows) and inner keys will be k (columns).
+    # Outer keys: j values (rows); inner keys: k values (columns)
     beta_results = {}
     pval_results = {}
+    r2_results = {}
     
     # Outer loop: iterate over each j (previous-return lookback) with a progress bar.
     for j in tqdm(j_list, desc="Processing j parameters (rows)"):
         beta_results[j] = {}
         pval_results[j] = {}
+        r2_results[j] = {}
         
         # Compute the previous return percentile series for parameter j.
         prev_df = add_prev_return_percentile_ranks(rets, j)
@@ -345,6 +348,7 @@ def compute_regression_matrices(rets: pl.DataFrame, j_list: list, k_list: list):
             if merged.height < 10:
                 beta_results[j][k] = np.nan
                 pval_results[j][k] = np.nan
+                r2_results[j][k] = np.nan
                 continue
                 
             # Convert the merged Polars DataFrame to a pandas DataFrame for statsmodels.
@@ -354,30 +358,37 @@ def compute_regression_matrices(rets: pl.DataFrame, j_list: list, k_list: list):
             X = sm.add_constant(mdf["prev"])
             y = mdf["look"]
             model = sm.OLS(y, X).fit()
+            
             beta_results[j][k] = model.params["prev"]
             pval_results[j][k] = model.pvalues["prev"]
-    
+            r2_results[j][k] = model.rsquared
+            
     # Convert nested dictionaries to pandas DataFrames.
-    # Rows correspond to j (previous lookback), and columns correspond to k (look-ahead holding period).
+    # Rows correspond to j (previous lookback) and columns correspond to k (look-ahead holding period).
     beta_df = pd.DataFrame(beta_results).T.sort_index()
     pval_df = pd.DataFrame(pval_results).T.sort_index()
+    r2_df   = pd.DataFrame(r2_results).T.sort_index()
     
-    # Rename index and columns explicitly
+    # Rename index and columns explicitly.
     beta_df.index.name = "j"
     beta_df.columns.name = "k"
     
     pval_df.index.name = "j"
     pval_df.columns.name = "k"
     
-    return beta_df, pval_df
+    r2_df.index.name = "j"
+    r2_df.columns.name = "k"
+    
+    return beta_df, pval_df, r2_df
 
-def plot_heatmaps_j_k(beta_df: pd.DataFrame, pval_df: pd.DataFrame):
+def plot_heatmaps(beta_df: pd.DataFrame, pval_df: pd.DataFrame, r2_df: pd.DataFrame):
     """
-    Given two DataFrames:
+    Given three DataFrames:
        - beta_df: rows indexed by j values and columns labeled by k values.
        - pval_df: same structure containing p-values.
-    This function creates two separate heatmaps (using matplotlib):
-       one for beta coefficients and one for p-values.
+       - r2_df: same structure containing R² values.
+    This function creates three separate heatmaps (using matplotlib):
+       one for beta coefficients, one for p-values, and one for R² values.
     """
     # Plot Beta heatmap.
     plt.figure(figsize=(8, 6))
@@ -387,7 +398,7 @@ def plot_heatmaps_j_k(beta_df: pd.DataFrame, pval_df: pd.DataFrame):
     plt.yticks(ticks=np.arange(len(beta_df.index)), labels=beta_df.index)
     plt.title("Beta Heatmap (rows: j, cols: k)")
     plt.xlabel("k (look-ahead holding period)")
-    plt.ylabel("j (previous lookback)")
+    plt.ylabel("j (prev lookback)")
     plt.show()
     
     # Plot P-Value heatmap.
@@ -398,16 +409,28 @@ def plot_heatmaps_j_k(beta_df: pd.DataFrame, pval_df: pd.DataFrame):
     plt.yticks(ticks=np.arange(len(pval_df.index)), labels=pval_df.index)
     plt.title("P-Value Heatmap (rows: j, cols: k)")
     plt.xlabel("k (look-ahead holding period)")
-    plt.ylabel("j (previous lookback)")
+    plt.ylabel("j (prev lookback)")
+    plt.show()
+    
+    # Plot R² heatmap.
+    plt.figure(figsize=(8, 6))
+    plt.imshow(r2_df.values, aspect='auto', cmap='viridis')
+    plt.colorbar(label='R²')
+    plt.xticks(ticks=np.arange(len(r2_df.columns)), labels=r2_df.columns)
+    plt.yticks(ticks=np.arange(len(r2_df.index)), labels=r2_df.index)
+    plt.title("R² Heatmap (rows: j, cols: k)")
+    plt.xlabel("k (look-ahead holding period)")
+    plt.ylabel("j (prev lookback)")
     plt.show()
 
-def rank_param(df):
+def rank_param(df,ascending=True):
   # Melt the DataFrame to long format
   long_df = df.reset_index().melt(id_vars='j', var_name='k', value_name='value')
   # Rename the columns for clarity
   long_df.columns = ['j', 'k', 'value']
   # Rank the values from min to max
-  long_df['rank'] = long_df['value'].rank()
+  long_df['rank'] = long_df['value'].rank(ascending=ascending)
   # Sort the DataFrame by rank
   long_df = long_df.sort_values(by='rank')
   return long_df
+
