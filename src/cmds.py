@@ -5,24 +5,29 @@ import statsmodels.api as sm
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+
+# -------------------------------
+# Helper Function: Percentile Rank
+# -------------------------------
 def compute_percentile_rank_series(series, interval: int = None, window: int = None, min_periods=None):
     """
     Compute the percentile rank for a numeric series.
     
     For each index i, the percentile rank is computed using a subset of historical returns:
-    
-    - If `interval` is provided as an integer, we select values at indices:
-          i, i-interval, i-2*interval, ...
-      If `interval` is None, then we use every index.
-      
-    - If `window` is None (default), the lookback is expanding (i.e. all available valid observations are used).
-      If `window` is an integer, only the most recent `window` observations (based on the sampling determined by interval) are used.
-      
-    The percentile rank at index i is defined as:
-    
-         rank = (number of valid values in the selected window that are <= current value)
-                / (total number of valid values in the selected window)
-                
+      - If `interval` is provided as an integer, we select values at indices:
+            i, i-interval, i-2*interval, ...
+        If `interval` is None, then we use every index.
+      - If `window` is None (default), the lookback is expanding (i.e. all available valid observations are used).
+        If `window` is an integer, only the most recent `window` observations (based on the sampling determined by interval) are used.
+      - The percentile rank at index i is defined as:
+        
+            rank = (number of valid values in the selected window that are <= current value)
+                   / (total number of valid values in the selected window)
+        
     If min_periods is specified, then if the number of valid observations is less than min_periods,
     the percentile rank is set to None.
     """
@@ -71,110 +76,165 @@ def compute_percentile_rank_series(series, interval: int = None, window: int = N
 
     return ranks
 
-# Example integration into the DataFrame processing:
-def add_prev_return_percentile_ranks(df: pl.DataFrame, j: int, 
-                                interval: int = None, window: int = None, 
-                                min_periods: int = None) -> pl.DataFrame:
+# -------------------------------
+# Updated Helper Functions for Percentile Ranks
+# -------------------------------
+def add_prev_return_percentile_ranks(prices, weights, j, window=None, min_periods=None):
     """
-    For a Polars DataFrame 'df' with a date column and asset price columns,
-    compute the j-day log return for each asset, then calculate the percentile rank
-    of that return using a historical lookback.
+    Computes the percentile ranks for the j-day previous log return.
+    
+    If weights is provided, it computes the portfolio return as a weighted sum of individual asset returns.
+    If weights is None, prices is assumed to contain only one ticker.
+    Returns a DataFrame with a single column 'prev_p' and the same index as prices.
+    """
+    # Compute j-day log returns: r_{t-j,t} = ln(P_t / P_{t-j})
+    log_returns = np.log(prices / prices.shift(j))
+    
+    if weights is not None:
+        if weights.shape != prices.shape:
+            raise ValueError("Weights must have the same shape as prices.")
+        # Compute portfolio return as the weighted sum across tickers.
+        port_return = (log_returns * weights).sum(axis=1)
+    else:
+        if prices.shape[1] != 1:
+            raise ValueError("When weights is None, prices should have a single ticker.")
+        port_return = log_returns.iloc[:, 0]
+    
+    # Convert the return series to list and compute percentile ranks.
+    ret_list = port_return.tolist()
+    percentiles = compute_percentile_rank_series(ret_list, interval=j, window=window, min_periods=min_periods)
+    return pd.DataFrame({'prev_p': percentiles}, index=prices.index)
+
+def add_lookahead_return_percentile_ranks(prices, weights, k, window=None, min_periods=None):
+    """
+    Computes the percentile ranks for the k-day look-ahead log return.
+    
+    If weights is provided, it computes the portfolio look-ahead return as a weighted sum.
+    If weights is None, prices is assumed to contain only one ticker.
+    Returns a DataFrame with a single column 'lookahead_p' and the same index as prices.
+    """
+    # Compute k-day lookahead log returns: r_{t,t+k} = ln(P_{t+k} / P_t)
+    lookahead_returns = np.log(prices.shift(-k) / prices)
+    
+    if weights is not None:
+        if weights.shape != prices.shape:
+            raise ValueError("Weights must have the same shape as prices.")
+        port_return = (lookahead_returns * weights).sum(axis=1)
+    else:
+        if prices.shape[1] != 1:
+            raise ValueError("When weights is None, prices should have a single ticker.")
+        port_return = lookahead_returns.iloc[:, 0]
+    
+    ret_list = port_return.tolist()
+    percentiles = compute_percentile_rank_series(ret_list, interval=k, window=window, min_periods=min_periods)
+    return pd.DataFrame({'lookahead_p': percentiles}, index=prices.index)
+
+# -------------------------------
+# Regression Function
+# -------------------------------
+def regression_percentile_ranks(prices, weights, j_list, k_list, window=None, min_periods=None):
+    """
+    For each combination of previous lookback j in j_list and look-ahead holding period k in k_list,
+    computes the percentile ranks for the j-day previous log return and k-day lookahead log return.
+    Then runs the regression:
+    
+         lookahead_p = alpha + beta * prev_p + epsilon
+    
+    For each j and k combination, saves the beta coefficient, its p-value, and the R^2 of the regression.
     
     Parameters:
-      df: Polars DataFrame. The first column must be 'date', and the rest are price columns.
-      j: lookback period in days to compute the log return:
-             r_{t-j, t} = ln(P_t / P_{t-j})
-      interval: if provided as an integer, only every interval-spaced return is used for the percentile rank.
-                If None, every day's return is used.
-                (Default behavior: use the passed j as the interval if desired, e.g. interval=j)
-      window: if None (default), then the historical lookback is expanding (all available interval-spaced returns).
-              If an integer, then a rolling window of that many observations is used.
-      min_periods: If provided, requires at least min_periods valid returns in the selected window to compute the rank.
+      prices: pd.DataFrame of prices (dates as index, tickers as columns).
+      weights: pd.DataFrame of weights (same shape as prices) or None (in which case prices should have one column).
+      j_list: list of integers (previous lookback periods).
+      k_list: list of integers (look-ahead holding periods).
+      window: window parameter to be passed to the helper functions.
+      min_periods: minimum valid observations required to compute percentile rank.
     
     Returns:
-      A new Polars DataFrame with the 'date' column and, for each ticker, a column containing the percentile
-      rank of the j-day log return computed over the selected historical window.
+      Three DataFrames: beta_df, pval_df, r2_df. The rows are labelled by j and columns by k.
     """
-    # Start with the date column.
-    result = df.select("date")
-    # Assume all columns except "date" are tickers.
-    tickers = [col for col in df.columns if col != "date"]
+    # Initialize empty DataFrames to store results.
+    beta_df = pd.DataFrame(index=j_list, columns=k_list, dtype=float)
+    pval_df = pd.DataFrame(index=j_list, columns=k_list, dtype=float)
+    r2_df = pd.DataFrame(index=j_list, columns=k_list, dtype=float)
     
-    for ticker in tickers:
-        ret_col = f"{ticker}_ret"
-        # Compute the j-day log return. This will produce NaN for the first j rows.
-        df = df.with_columns(
-            (pl.col(ticker) / pl.col(ticker).shift(j)).log().alias(ret_col)
-        )
-        # Convert the return column to a list.
-        ret_values = df[ret_col].to_list()
-        
-        # If interval is not provided, we default it to j (i.e. use every j-th day)
-        eff_interval = j if interval is None else interval
-        # Compute the percentile rank with the given parameters.
-        percentiles = compute_percentile_rank_series(ret_values, interval=eff_interval, window=window, min_periods=min_periods)
-        
-        # Add the resulting percentile ranks to the output DataFrame.
-        result = result.with_columns(pl.Series(name=ticker, values=percentiles))
+    for j in tqdm(j_list, desc="Processing j values"):
+        # Compute previous percentile ranks for j-day return.
+        prev_df = add_prev_return_percentile_ranks(prices, weights, j, window=window, min_periods=min_periods)
+        for k in tqdm(k_list, desc="Processing k values", leave=False):
+            # Compute lookahead percentile ranks for k-day return.
+            lookahead_df = add_lookahead_return_percentile_ranks(prices, weights, k, window=window, min_periods=min_periods)
+            # Merge the two series on the date index.
+            reg_df = prev_df.join(lookahead_df)
+            reg_df = reg_df.dropna()
+            if len(reg_df) == 0:
+                beta_df.loc[j, k] = np.nan
+                pval_df.loc[j, k] = np.nan
+                r2_df.loc[j, k] = np.nan
+                continue
+            
+            # Run the regression: lookahead_p = alpha + beta * prev_p + epsilon
+            X = reg_df['prev_p']
+            y = reg_df['lookahead_p']
+            X = sm.add_constant(X)
+            model = sm.OLS(y, X).fit()
+            
+            beta_df.loc[j, k] = model.params['prev_p']
+            pval_df.loc[j, k] = model.pvalues['prev_p']
+            r2_df.loc[j, k] = model.rsquared
     
-    return result
+    return beta_df, pval_df, r2_df
+
+# -------------------------------
+# Plotting Function
+# -------------------------------
+def plot_heatmaps(beta_df: pd.DataFrame, pval_df: pd.DataFrame, r2_df: pd.DataFrame):
+    """
+    Given three DataFrames:
+       - beta_df: rows indexed by j values and columns labeled by k values.
+       - pval_df: same structure containing p-values.
+       - r2_df: same structure containing R² values.
+    This function creates three separate heatmaps (using matplotlib):
+       one for beta coefficients, one for p-values, and one for R² values.
+    """
+    # Set up a common plotting style.
+    # plt.style.use('seaborn-whitegrid')
+    
+    # Plot Beta heatmap.
+    plt.figure(figsize=(8, 6))
+    plt.imshow(beta_df.values, aspect='auto', cmap='viridis')
+    plt.colorbar(label='Beta')
+    plt.xticks(ticks=np.arange(len(beta_df.columns)), labels=beta_df.columns)
+    plt.yticks(ticks=np.arange(len(beta_df.index)), labels=beta_df.index)
+    plt.title("Beta Heatmap (rows: j, cols: k)")
+    plt.xlabel("k (look-ahead holding period)")
+    plt.ylabel("j (previous lookback)")
+    plt.show()
+    
+    # Plot P-Value heatmap.
+    plt.figure(figsize=(8, 6))
+    plt.imshow(pval_df.values, aspect='auto', cmap='viridis')
+    plt.colorbar(label='P-Value')
+    plt.xticks(ticks=np.arange(len(pval_df.columns)), labels=pval_df.columns)
+    plt.yticks(ticks=np.arange(len(pval_df.index)), labels=pval_df.index)
+    plt.title("P-Value Heatmap (rows: j, cols: k)")
+    plt.xlabel("k (look-ahead holding period)")
+    plt.ylabel("j (previous lookback)")
+    plt.show()
+    
+    # Plot R² heatmap.
+    plt.figure(figsize=(8, 6))
+    plt.imshow(r2_df.values, aspect='auto', cmap='viridis')
+    plt.colorbar(label='R²')
+    plt.xticks(ticks=np.arange(len(r2_df.columns)), labels=r2_df.columns)
+    plt.yticks(ticks=np.arange(len(r2_df.index)), labels=r2_df.index)
+    plt.title("R² Heatmap (rows: j, cols: k)")
+    plt.xlabel("k (look-ahead holding period)")
+    plt.ylabel("j (previous lookback)")
+    plt.show()
 
 
-def add_lookahead_return_percentile_ranks(df: pl.DataFrame, k: int, 
-                                          interval: int = None, window: int = None, 
-                                          min_periods: int = None) -> pl.DataFrame:
-    """
-    For a Polars DataFrame 'df' with a date column and asset price columns,
-    compute the k-day look-ahead log return for each asset, then calculate the percentile rank
-    of that look-ahead return over a historical window.
-    
-    The look-ahead log return is defined as:
-    
-         r_{t,t+k} = ln(P_{t+k} / P_t)
-    
-    where P_t is the asset price at time t.
-    
-    Parameters:
-      df: Polars DataFrame. The first column must be 'date', and the remaining columns are asset prices.
-      k: Holding period (in days) for the look-ahead return.
-      interval: If provided as an integer, only every interval-spaced return is used for the percentile rank.
-                If None, every day's look-ahead return is used.
-                (Default behavior: if left as None, you can default to using k as the interval.)
-      window: If None (default), then the lookback is expanding (i.e. all available valid observations are used).
-              If an integer, then a rolling window of that many (interval-spaced) observations is used.
-      min_periods: If provided, the percentile rank is computed only if there are at least this many valid returns in the selected window.
-    
-    Returns:
-      A new Polars DataFrame with the 'date' column and, for each ticker, a column containing the percentile rank
-      of the k-day look-ahead log return computed over the selected historical window.
-    """
-    # Start with the date column.
-    result = df.select("date")
-    # All columns except "date" are assumed to be asset tickers.
-    tickers = [col for col in df.columns if col != "date"]
-    
-    for ticker in tickers:
-        ret_col = f"{ticker}_lookahead_ret"
-        # Compute the look-ahead log return: ln(P[t+k] / P[t]).
-        # This will produce NaN for the last k rows.
-        df = df.with_columns(
-            (pl.col(ticker).shift(-k) / pl.col(ticker)).log().alias(ret_col)
-        )
-        # Convert the computed return column to a list.
-        ret_values = df[ret_col].to_list()
-        
-        # If interval is not provided, default to k.
-        effective_interval = k if interval is None else interval
-        
-        # Compute the percentile rank series.
-        percentiles = compute_percentile_rank_series(ret_values, interval=effective_interval, window=window, min_periods=min_periods)
-        
-        # Add the computed look-ahead percentile ranks to the result DataFrame.
-        result = result.with_columns(pl.Series(name=ticker, values=percentiles))
-    
-    return result
-
-def equal_weight_portfolio(df: pl.DataFrame):
+def equal_weight_portfolio(df: pl.DataFrame, to_pd=True):
     """
     Given a Polars DataFrame of returns (with a 'date' column and one column per coin),
     returns two DataFrames:
@@ -214,9 +274,14 @@ def equal_weight_portfolio(df: pl.DataFrame):
     weights_exprs = [pl.lit(1/n_coins).alias(coin) for coin in coin_cols]
     weights_df = df.select(["date"]).with_columns(weights_exprs)
     
+    if to_pd:
+      portfolio_df = portfolio_df.to_pandas()
+      portfolio_df.set_index('date', inplace=True)
+      weights_df = weights_df.to_pandas()
+      weights_df.set_index('date', inplace=True)
     return portfolio_df, weights_df
 
-def marketcap_weighted_portfolio(return_df: pl.DataFrame, mcap_df: pl.DataFrame):
+def marketcap_weighted_portfolio(return_df: pl.DataFrame, mcap_df: pl.DataFrame, to_pd=True):
     """
     Given:
       - return_df: A Polars DataFrame of daily returns with a "date" column and one column per coin.
@@ -264,173 +329,123 @@ def marketcap_weighted_portfolio(return_df: pl.DataFrame, mcap_df: pl.DataFrame)
     # Compute weights for each coin: weight = coin's market cap / total market cap.
     for coin in common_coins:
         daily = daily.with_columns(
-            (pl.col(f"{coin}_mcap") / pl.col("total_mcap")).alias(f"w_{coin}")
+            (pl.col(f"{coin}_mcap") / pl.col("total_mcap")).alias(f"{coin}")
         )
     
     # Compute the market-cap weighted portfolio return.
     # For each coin, multiply its return (from the return_df) by its weight and sum.
-    portfolio_expr = sum(pl.col(f"w_{coin}") * pl.col(coin) for coin in common_coins)
+    portfolio_expr = sum(pl.col(f"{coin}") * pl.col(coin) for coin in common_coins)
     portfolio_df = daily.with_columns(
         portfolio_expr.alias("MCW_return")
     ).select(["date", "MCW_return"])
     
     # Create a weights DataFrame with date and each coin's weight.
-    weight_cols = [f"w_{coin}" for coin in common_coins]
+    weight_cols = [f"{coin}" for coin in common_coins]
     weights_df = daily.select(["date"] + weight_cols)
     
+    if to_pd:
+      portfolio_df = portfolio_df.to_pandas()
+      portfolio_df.set_index('date', inplace=True)
+      weights_df = weights_df.to_pandas()
+      weights_df.set_index('date', inplace=True)
     return portfolio_df, weights_df
 
-
-def compute_regression_matrices(rets: pl.DataFrame, j_list: list, k_list: list):
-    """
-    Given a Polars DataFrame 'rets' with a "date" column and a single ticker column,
-    and lists of lookback parameters j_list and holding period parameters k_list,
-    this function:
+def get_signals(price_df, weights, j, p, long_short='long-short', style='momentum', min_periods=None, window=None):
+    # Validate input dimensions.
+    if weights is None:
+        if price_df.shape[1] != 1:
+            raise ValueError("Weights must be provided when multiple tickers are present.")
+    else:
+        if weights.shape != price_df.shape:
+            raise ValueError("Weights must have the same shape as price_df.")
     
-      1. Checks that 'rets' has only one ticker column (besides "date").
-      2. For each combination of j (row: previous-return lookback) and k (column: look-ahead holding period):
-            - Computes the previous return percentile series: p_{t-j,t}
-              using add_prev_return_percentile_ranks(rets, j)
-            - Computes the look-ahead return percentile series: p_{t,t+k}
-              using add_lookahead_return_percentile_ranks(rets, k)
-            - Merges the two series on "date", drops rows with NA values in either series,
-              and then runs a linear regression:
-                look_ahead_p = alpha + beta * prev_p + epsilon
-            - Saves the beta coefficient, its p-value, and the R² of the regression.
-      3. Returns three pandas DataFrames:
-            - beta_df: rows indexed by j values, columns labeled by k values.
-            - pval_df: same structure containing the corresponding p-values.
-            - r2_df: same structure containing the R² values.
-            
+    # Compute the j-day log returns for each asset.
+    log_returns = np.log(price_df / price_df.shift(j))
+    
+    # Form portfolio return: either weighted sum or (if only one asset) the single return series.
+    if weights is not None:
+        port_return = (log_returns * weights).sum(axis=1)
+    else:
+        port_return = log_returns.iloc[:, 0]
+    
+    # Convert the portfolio return series to a list.
+    ret_list = port_return.tolist()
+    
+    # Compute the historical percentile rank for each j-day return using the provided helper.
+    # Here we use j as the interval (non-overlapping returns), with the optional window and min_periods.
+    percentiles = compute_percentile_rank_series(ret_list, interval=j, window=window, min_periods=min_periods)
+    percentiles_series = pd.Series(percentiles, index=port_return.index)
+    
+    # Define a helper to generate signals from a percentile rank.
+    def generate_signal(rank_val):
+        # Treat missing rank as a neutral signal.
+        if rank_val is None or (isinstance(rank_val, float) and np.isnan(rank_val)):
+            return 0
+        if style == 'momentum':
+            if long_short == 'long-short':
+                if rank_val > (1 - p):
+                    return 1
+                elif rank_val < p:
+                    return -1
+                else:
+                    return 0
+            elif long_short == 'long':
+                return 1 if rank_val > (1 - p) else 0
+            elif long_short == 'short':
+                return -1 if rank_val < p else 0
+            else:
+                raise ValueError("Invalid long_short value. Must be one of 'long-short', 'long', or 'short'.")
+        elif style == 'mean-reverting':
+            # For mean-reverting, flip the directions.
+            if long_short == 'long-short':
+                if rank_val > (1 - p):
+                    return -1
+                elif rank_val < p:
+                    return 1
+                else:
+                    return 0
+            elif long_short == 'long':
+                return 1 if rank_val < p else 0
+            elif long_short == 'short':
+                return -1 if rank_val > (1 - p) else 0
+            else:
+                raise ValueError("Invalid long_short value. Must be one of 'long-short', 'long', or 'short'.")
+        else:
+            raise ValueError("Invalid style. Must be either 'momentum' or 'mean-reverting'.")
+    
+    # Apply the signal generation to each computed percentile rank.
+    signals = percentiles_series.apply(generate_signal)
+    
+    # Align the signals with the full date index of price_df. Here we reindex, forward-fill (assuming signal persists)
+    # and fill any remaining missing values with 0.
+    signals_full = pd.Series(index=price_df.index, dtype=float)
+    signals_full.loc[signals.index] = signals
+    signals_full = signals_full.ffill().fillna(0)
+    
+    # Return a single-column DataFrame of signals.
+    return pd.DataFrame({'signal': signals_full})
+
+def rank_param(df, ascending=True):
+    """
+    Convert a wide-format parameter DataFrame (e.g., r2, pval, or beta) with index as j and columns as k 
+    into a long-format DataFrame with columns: 'j', 'k', 'value', and 'rank'. 
+    The ranking is done on the 'value' column in the order specified by `ascending`.
+
     Parameters:
-      rets: Polars DataFrame with columns ["date", ticker]
-      j_list: list of integer j parameters (for previous return lookback). These will index the rows.
-      k_list: list of integer k parameters (for look-ahead holding period). These will label the columns.
-      
+        df (pd.DataFrame): DataFrame with index as j and columns as k.
+        ascending (bool): If True, the lowest value gets rank 1, otherwise the highest gets rank 1.
+
     Returns:
-      beta_df, pval_df, r2_df
+        pd.DataFrame: A long-format DataFrame with columns ['j', 'k', 'value', 'rank'].
     """
-    # Check that there is only one ticker column (excluding "date")
-    ticker_cols = [col for col in rets.columns if col != "date"]
-    if len(ticker_cols) != 1:
-        raise ValueError("Input DataFrame must have exactly one ticker column (excluding 'date').")
-    ticker = ticker_cols[0]
+    # Convert from wide to long format.
+    long_df = df.stack().reset_index()
+    long_df.columns = ['j', 'k', 'value']
     
-    # Initialize dictionaries to collect regression results.
-    # Outer keys: j values (rows); inner keys: k values (columns)
-    beta_results = {}
-    pval_results = {}
-    r2_results = {}
+    # Compute rank based on 'value'.
+    long_df['rank'] = long_df['value'].rank(method='min', ascending=ascending)
     
-    # Outer loop: iterate over each j (previous-return lookback) with a progress bar.
-    for j in tqdm(j_list, desc="Processing j parameters (rows)"):
-        beta_results[j] = {}
-        pval_results[j] = {}
-        r2_results[j] = {}
-        
-        # Compute the previous return percentile series for parameter j.
-        prev_df = add_prev_return_percentile_ranks(rets, j)
-        # Rename the ticker column to "prev" for clarity.
-        prev_df = prev_df.rename({ticker: "prev"})
-        
-        # Inner loop: iterate over each k (look-ahead holding period) with a nested progress bar.
-        for k in tqdm(k_list, desc=f"j={j}: Processing k parameters (columns)", leave=False):
-            # Compute the look-ahead return percentile series for parameter k.
-            look_df = add_lookahead_return_percentile_ranks(rets, k)
-            # Rename the ticker column to "look" for clarity.
-            look_df = look_df.rename({ticker: "look"})
-            
-            # Merge the two DataFrames on "date" and drop rows with NA in either series.
-            merged = prev_df.join(look_df, on="date", how="inner")
-            merged = merged.drop_nulls(subset=["prev", "look"])
-            
-            # If too few observations remain, store NaN.
-            if merged.height < 10:
-                beta_results[j][k] = np.nan
-                pval_results[j][k] = np.nan
-                r2_results[j][k] = np.nan
-                continue
-                
-            # Convert the merged Polars DataFrame to a pandas DataFrame for statsmodels.
-            mdf = merged.to_pandas()
-            
-            # Set up the regression: y (look) = alpha + beta * prev + error.
-            X = sm.add_constant(mdf["prev"])
-            y = mdf["look"]
-            model = sm.OLS(y, X).fit()
-            
-            beta_results[j][k] = model.params["prev"]
-            pval_results[j][k] = model.pvalues["prev"]
-            r2_results[j][k] = model.rsquared
-            
-    # Convert nested dictionaries to pandas DataFrames.
-    # Rows correspond to j (previous lookback) and columns correspond to k (look-ahead holding period).
-    beta_df = pd.DataFrame(beta_results).T.sort_index()
-    pval_df = pd.DataFrame(pval_results).T.sort_index()
-    r2_df   = pd.DataFrame(r2_results).T.sort_index()
+    # Optionally, sort by rank.
+    long_df = long_df.sort_values('rank').reset_index(drop=True)
     
-    # Rename index and columns explicitly.
-    beta_df.index.name = "j"
-    beta_df.columns.name = "k"
-    
-    pval_df.index.name = "j"
-    pval_df.columns.name = "k"
-    
-    r2_df.index.name = "j"
-    r2_df.columns.name = "k"
-    
-    return beta_df, pval_df, r2_df
-
-def plot_heatmaps(beta_df: pd.DataFrame, pval_df: pd.DataFrame, r2_df: pd.DataFrame):
-    """
-    Given three DataFrames:
-       - beta_df: rows indexed by j values and columns labeled by k values.
-       - pval_df: same structure containing p-values.
-       - r2_df: same structure containing R² values.
-    This function creates three separate heatmaps (using matplotlib):
-       one for beta coefficients, one for p-values, and one for R² values.
-    """
-    # Plot Beta heatmap.
-    plt.figure(figsize=(8, 6))
-    plt.imshow(beta_df.values, aspect='auto', cmap='viridis')
-    plt.colorbar(label='Beta')
-    plt.xticks(ticks=np.arange(len(beta_df.columns)), labels=beta_df.columns)
-    plt.yticks(ticks=np.arange(len(beta_df.index)), labels=beta_df.index)
-    plt.title("Beta Heatmap (rows: j, cols: k)")
-    plt.xlabel("k (look-ahead holding period)")
-    plt.ylabel("j (prev lookback)")
-    plt.show()
-    
-    # Plot P-Value heatmap.
-    plt.figure(figsize=(8, 6))
-    plt.imshow(pval_df.values, aspect='auto', cmap='viridis')
-    plt.colorbar(label='P-Value')
-    plt.xticks(ticks=np.arange(len(pval_df.columns)), labels=pval_df.columns)
-    plt.yticks(ticks=np.arange(len(pval_df.index)), labels=pval_df.index)
-    plt.title("P-Value Heatmap (rows: j, cols: k)")
-    plt.xlabel("k (look-ahead holding period)")
-    plt.ylabel("j (prev lookback)")
-    plt.show()
-    
-    # Plot R² heatmap.
-    plt.figure(figsize=(8, 6))
-    plt.imshow(r2_df.values, aspect='auto', cmap='viridis')
-    plt.colorbar(label='R²')
-    plt.xticks(ticks=np.arange(len(r2_df.columns)), labels=r2_df.columns)
-    plt.yticks(ticks=np.arange(len(r2_df.index)), labels=r2_df.index)
-    plt.title("R² Heatmap (rows: j, cols: k)")
-    plt.xlabel("k (look-ahead holding period)")
-    plt.ylabel("j (prev lookback)")
-    plt.show()
-
-def rank_param(df,ascending=True):
-  # Melt the DataFrame to long format
-  long_df = df.reset_index().melt(id_vars='j', var_name='k', value_name='value')
-  # Rename the columns for clarity
-  long_df.columns = ['j', 'k', 'value']
-  # Rank the values from min to max
-  long_df['rank'] = long_df['value'].rank(ascending=ascending)
-  # Sort the DataFrame by rank
-  long_df = long_df.sort_values(by='rank')
-  return long_df
-
+    return long_df
