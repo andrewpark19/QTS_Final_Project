@@ -350,6 +350,10 @@ def marketcap_weighted_portfolio(return_df: pl.DataFrame, mcap_df: pl.DataFrame,
       weights_df.set_index('date', inplace=True)
     return portfolio_df, weights_df
 
+# -------------------------------
+# Signal Generation
+# -------------------------------
+
 def get_signals(price_df, weights, j, p, long_short='long-short', style='momentum', min_periods=None, window=None):
     # Validate input dimensions.
     if weights is None:
@@ -449,3 +453,93 @@ def rank_param(df, ascending=True):
     long_df = long_df.sort_values('rank').reset_index(drop=True)
     
     return long_df
+
+def get_signals(price_df, weights, j, p, long_short='long-short', style='momentum', min_periods=None, window=None):
+    """
+    Computes trading signals based on the j-day previous log return percentile ranks.
+    
+    When weights is provided, the portfolio percentile rank is computed as the weighted sum 
+    of individual asset returns. Otherwise, the function expects a single-ticker price DataFrame.
+    
+    Parameters:
+      price_df : pd.DataFrame
+          Prices of assets with dates as index and tickers as columns.
+      weights : pd.DataFrame or None
+          Weights for each ticker (same shape as price_df) or None (if only one ticker is present).
+      j : int
+          Look-back period for computing j-day log returns.
+      p : float
+          Threshold percentile (between 0 and 0.5) for generating signals.
+      long_short : str, optional
+          One of 'long-short', 'long', or 'short'. Default is 'long-short'.
+      style : str, optional
+          Either 'momentum' or 'mean-reverting'. Default is 'momentum'.
+      min_periods : int, optional
+          Minimum number of observations required for computing percentile rank.
+      window : int, optional
+          Window size to use when computing the historical percentile rank.
+          
+    Returns:
+      pd.DataFrame
+          A single-column DataFrame with the trading signal for each date.
+    """
+    # Validate dimensions.
+    if weights is None:
+        if price_df.shape[1] != 1:
+            raise ValueError("Weights must be provided when multiple tickers are present.")
+    else:
+        if weights.shape != price_df.shape:
+            raise ValueError("Weights must have the same shape as price_df.")
+    
+    # Compute the portfolio's j-day previous percentile rank using the helper.
+    # When weights is provided, the helper computes a weighted portfolio; otherwise, it expects a single ticker.
+    prev_df = add_prev_return_percentile_ranks(price_df, weights, j, window=window, min_periods=min_periods)
+    percentile_series = prev_df['prev_p']
+    
+    # Define the signal generation function.
+    def generate_signal(rank_val):
+        # Treat missing values as neutral signal.
+        if rank_val is None or (isinstance(rank_val, float) and np.isnan(rank_val)):
+            return 0
+        if style == 'momentum':
+            if long_short == 'long-short':
+                if rank_val > (1 - p):
+                    return 1
+                elif rank_val < p:
+                    return -1
+                else:
+                    return 0
+            elif long_short == 'long':
+                return 1 if rank_val > (1 - p) else 0
+            elif long_short == 'short':
+                return -1 if rank_val < p else 0
+            else:
+                raise ValueError("Invalid long_short value. Must be one of 'long-short', 'long', or 'short'.")
+        elif style == 'mean-reverting':
+            # For mean-reverting strategies, flip the signal direction.
+            if long_short == 'long-short':
+                if rank_val > (1 - p):
+                    return -1
+                elif rank_val < p:
+                    return 1
+                else:
+                    return 0
+            elif long_short == 'long':
+                return 1 if rank_val < p else 0
+            elif long_short == 'short':
+                return -1 if rank_val > (1 - p) else 0
+            else:
+                raise ValueError("Invalid long_short value. Must be one of 'long-short', 'long', or 'short'.")
+        else:
+            raise ValueError("Invalid style. Must be either 'momentum' or 'mean-reverting'.")
+    
+    # Generate signals based on the computed percentile ranks.
+    signals = percentile_series.apply(generate_signal)
+    
+    # Align signals with the full date index of price_df by reindexing and filling any remaining missing values with 0.
+    signals_full = pd.Series(index=price_df.index, dtype=float)
+    signals_full.loc[signals.index] = signals
+    signals_full = signals_full.fillna(0)
+    
+    # Return the signal as a single-column DataFrame.
+    return pd.DataFrame({'signal': signals_full})
